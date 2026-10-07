@@ -81,8 +81,73 @@ def read_sections(csv_path: Path) -> tuple[dict[str, list[list[str]]], list[list
     return sections, rows, encoding_used
 
 
+# Axis names without an X/Y prefix (e.g. A1, B1) are mapped to a direction by make_model.
+AXIS_DIRECTIONS: dict[str, str] = {}
+AXIS_PATTERN = None
+
+
 def axes_in(value: str) -> list[str]:
+    if AXIS_PATTERN is not None:
+        return AXIS_PATTERN.findall(clean(value))
     return re.findall(r"[XY]\d+[A-Za-z]*", clean(value), flags=re.IGNORECASE)
+
+
+def axis_dir(axis: str) -> str:
+    return AXIS_DIRECTIONS.get(axis.upper(), axis[:1].upper())
+
+
+def assign_axis_directions(axis_names: list[str], sections: dict[str, list[list[str]]]) -> None:
+    """Set AXIS_DIRECTIONS/AXIS_PATTERN for axis names that do not start with X/Y."""
+    global AXIS_PATTERN
+    AXIS_DIRECTIONS.clear()
+    AXIS_PATTERN = None
+    if all(axis[:1] in ("X", "Y") for axis in axis_names):
+        return
+    names = sorted(set(axis_names), key=len, reverse=True)
+    AXIS_PATTERN = re.compile(
+        r"(?<![0-9A-Za-z])(" + "|".join(re.escape(name) for name in names) + r")(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    )
+    parent = {name: name for name in axis_names}
+
+    def root(name):
+        while parent[name] != name:
+            name = parent[name]
+        return name
+
+    for row in sections.get("基準スパン長", []):
+        pair = [axis.upper() for axis in axes_in(row[0])]
+        if len(pair) == 2 and pair[0] in parent and pair[1] in parent:
+            parent[root(pair[0])] = root(pair[1])
+    groups: dict[str, list[str]] = {}
+    for name in axis_names:
+        groups.setdefault(root(name), []).append(name)
+    if len(groups) != 2:
+        raise ValueError(f"Axis names must form two span chains (X and Y); found {len(groups)}")
+    first, second = groups.values()
+
+    span_counts = {}
+    for row in sections.get("基本事項", []):
+        for value in row:
+            match = re.fullmatch(r"([XY])方向スパン数", clean(value))
+            if match and row[-1].strip():
+                span_counts[match.group(1)] = int(number(row[-1]))
+    x_group = None
+    if span_counts.get("X") is not None and span_counts.get("X") != span_counts.get("Y"):
+        x_group = next((group for group in (first, second) if len(group) - 1 == span_counts["X"]), None)
+    if x_group is None:
+        # Nodes are written as "X axis - Y axis" (e.g. 柱配置 "A1 - B4").
+        node_texts = [row[1] for row in sections.get("柱配置", []) if len(row) > 1]
+        node_texts += [row[0] for row in sections.get("軸振れ", []) if row]
+        for text in node_texts:
+            nodes = [axis.upper() for axis in axes_in(text)]
+            if len(nodes) == 2:
+                x_group = first if nodes[0] in first else second
+                break
+    if x_group is None:
+        raise ValueError("Could not decide which axis names are X and which are Y")
+    for name in axis_names:
+        AXIS_DIRECTIONS[name] = "X" if name in x_group else "Y"
 
 
 def steel_section(value: str):
@@ -114,8 +179,8 @@ def first_steel_section(row: list[str], preferred: tuple[int, ...] = ()):
 
 def node_from(value: str) -> tuple[str, str]:
     axes = [axis.upper() for axis in axes_in(value)]
-    xs = [axis for axis in axes if axis.startswith("X")]
-    ys = [axis for axis in axes if axis.startswith("Y")]
+    xs = [axis for axis in axes if axis_dir(axis) == "X"]
+    ys = [axis for axis in axes if axis_dir(axis) == "Y"]
     if len(xs) != 1 or len(ys) != 1:
         raise ValueError(f"Node could not be parsed: {value!r}")
     return xs[0], ys[0]
@@ -126,9 +191,9 @@ def segment_from(value: str) -> tuple[tuple[str, str], tuple[str, str]]:
     if len(axes) != 3:
         raise ValueError(f"Frame segment could not be parsed: {value!r}")
     frame, start, end = axes
-    if frame.startswith("Y") and start.startswith("X") and end.startswith("X"):
+    if axis_dir(frame) == "Y" and axis_dir(start) == "X" and axis_dir(end) == "X":
         return (start, frame), (end, frame)
-    if frame.startswith("X") and start.startswith("Y") and end.startswith("Y"):
+    if axis_dir(frame) == "X" and axis_dir(start) == "Y" and axis_dir(end) == "Y":
         return (frame, start), (frame, end)
     raise ValueError(f"Unexpected frame/axis order: {value!r}")
 
@@ -436,8 +501,9 @@ def make_model(csv_path: Path) -> dict:
         raise ValueError("Required SS7 sections are missing or empty: " + ", ".join(missing))
 
     axis_names = [clean(row[0]).upper() for row in sections["軸名"] if row]
-    x_axes = [axis for axis in axis_names if axis.startswith("X")]
-    y_axes = [axis for axis in axis_names if axis.startswith("Y")]
+    assign_axis_directions(axis_names, sections)
+    x_axes = [axis for axis in axis_names if axis_dir(axis) == "X"]
+    y_axes = [axis for axis in axis_names if axis_dir(axis) == "Y"]
     if not x_axes or not y_axes:
         raise ValueError("Both X and Y axis names are required")
 
@@ -449,7 +515,7 @@ def make_model(csv_path: Path) -> dict:
 
     def build_axis_positions(names, prefix):
         positions = {names[0]: 0.0}
-        relevant = [(a, b, length) for a, b, length in span_rows if a.startswith(prefix) and b.startswith(prefix)]
+        relevant = [(a, b, length) for a, b, length in span_rows if axis_dir(a) == prefix and axis_dir(b) == prefix]
         for _ in range(len(names) + len(relevant)):
             changed = False
             for start, end, length in relevant:
@@ -991,8 +1057,8 @@ def make_model(csv_path: Path) -> dict:
             warning_counts["floor assemblies with unknown layers skipped"] += 1
             continue
         axes = [axis.upper() for axis in axes_in(area)]
-        xs = [axis for axis in axes if axis.startswith("X")]
-        ys = [axis for axis in axes if axis.startswith("Y")]
+        xs = [axis for axis in axes if axis_dir(axis) == "X"]
+        ys = [axis for axis in axes if axis_dir(axis) == "Y"]
         if len(xs) != 2 or len(ys) != 2:
             warning_counts["unparsed floor-assembly areas skipped"] += 1
             continue
@@ -1281,8 +1347,8 @@ def make_model(csv_path: Path) -> dict:
             continue
         layer = clean(row[0])
         axes = [axis.upper() for axis in axes_in(row[1])]
-        xs = [axis for axis in axes if axis.startswith("X")]
-        ys = [axis for axis in axes if axis.startswith("Y")]
+        xs = [axis for axis in axes if axis_dir(axis) == "X"]
+        ys = [axis for axis in axes if axis_dir(axis) == "Y"]
         if len(xs) != 2 or len(ys) != 2:
             warning_counts["unparsed horizontal brace areas skipped"] += 1
             continue
@@ -1309,8 +1375,8 @@ def make_model(csv_path: Path) -> dict:
             continue
         layer = clean(row[0])
         axes = [axis.upper() for axis in axes_in(row[1])]
-        xs = [axis for axis in axes if axis.startswith("X")]
-        ys = [axis for axis in axes if axis.startswith("Y")]
+        xs = [axis for axis in axes if axis_dir(axis) == "X"]
+        ys = [axis for axis in axes if axis_dir(axis) == "Y"]
         if len(xs) != 2 or len(ys) != 2:
             warning_counts["unparsed slab areas skipped"] += 1
             continue

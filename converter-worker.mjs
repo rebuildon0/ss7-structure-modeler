@@ -184,8 +184,7 @@ converter.write_report(web_model, web_output / f'{web_prefix}_conversion_report.
       preview,
     };
   } finally {
-    pyodide.globals.delete("web_prefix");
-    pyodide.globals.delete("web_verification_json");
+    pyodide.runPython("for _name in ('web_prefix', 'web_verification_json'): globals().pop(_name, None)");
     pyodide.runPython("import shutil; shutil.rmtree('/tmp/ss7-web-output', ignore_errors=True)");
     pyodide.FS.unlink("/tmp/ss7-web-input.csv");
   }
@@ -200,6 +199,7 @@ self.onmessage = async (event) => {
     if (result.preview) transfer.push(result.preview.bytes.buffer);
     self.postMessage({ type: "complete", result }, transfer);
   } catch (error) {
-    self.postMessage({ type: "error", message: error?.message || "変換できませんでした。" });
+    const lines = String(error?.message || "").trim().split(/\r?\n/);
+    self.postMessage({ type: "error", message: lines[lines.length - 1] || "変換できませんでした。" });
   }
 };
