@@ -18,12 +18,7 @@ const rhinoReady = rhino3dm({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/rhino3dm@8.35.0/${file}`,
 });
 
-function colorForKind(kind, colors) {
-  const color = colors[kind] || [180, 180, 180];
-  return { r: color[0], g: color[1], b: color[2], a: 255 };
-}
-
-function make3dm(model, rhino, colors, kindFromLayer) {
+function make3dm(model, rhino) {
   const document = new rhino.File3dm();
   const settings = document.settings();
   settings.modelUnitSystem = rhino.UnitSystem.Millimeters;
@@ -32,11 +27,12 @@ function make3dm(model, rhino, colors, kindFromLayer) {
 
   const layers = document.layers();
   const layerIndexes = new Map();
-  for (const name of [...new Set(model.objects.map((object) => object.layer))].sort()) {
+  for (const entry of model.rhino_layers) {
     const layer = new rhino.Layer();
-    layer.name = name;
-    layer.color = colorForKind(kindFromLayer(name), colors);
-    layerIndexes.set(name, layers.add(layer));
+    layer.name = entry.name;
+    layer.color = { r: entry.color[0], g: entry.color[1], b: entry.color[2], a: 255 };
+    if (entry.parent) layer.parentLayerId = layers.findIndex(layerIndexes.get(entry.parent)).id;
+    layerIndexes.set(entry.path, layers.add(layer));
   }
 
   for (const object of model.objects) {
@@ -53,7 +49,7 @@ function make3dm(model, rhino, colors, kindFromLayer) {
     mesh.compact();
     const attributes = new rhino.ObjectAttributes();
     attributes.name = object.name;
-    attributes.layerIndex = layerIndexes.get(object.layer);
+    attributes.layerIndex = layerIndexes.get(object.rhino_layer);
     for (const [key, value] of Object.entries({
       Kind: object.kind,
       Level: object.level,
@@ -143,9 +139,7 @@ converter.write_preview(web_model, web_output / f'{web_prefix}_rhino_preview.png
 json.dumps(web_model, ensure_ascii=False)
 `);
     const model = JSON.parse(modelJson);
-    const colors = JSON.parse(pyodide.runPython("json.dumps(converter.COLORS)"));
-    const kinds = JSON.parse(pyodide.runPython("json.dumps({name: converter.kind_from_layer(name) for name in {obj['layer'] for obj in web_model['objects']}})"));
-    const { bytes: modelBytes, verification } = make3dm(model, rhino, colors, (name) => kinds[name]);
+    const { bytes: modelBytes, verification } = make3dm(model, rhino);
     pyodide.FS.writeFile(`/tmp/ss7-web-output/${safePrefix}_rhino_model.3dm`, modelBytes);
     pyodide.globals.set("web_verification_json", JSON.stringify(verification));
     pyodide.runPython(`

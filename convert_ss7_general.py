@@ -10,6 +10,7 @@ written.
 from __future__ import annotations
 
 import argparse
+import colorsys
 import csv
 import importlib
 import json
@@ -1794,6 +1795,7 @@ def make_model(csv_path: Path) -> dict:
             {"message": message, "row_count": count} for message, count in sorted(warning_counts.items())
         ],
         "skipped_sections": skipped_sections,
+        "rhino_layers": assign_rhino_layers(objects, layers_top_down[-1]),
         "objects": objects,
         "centerlines": centerlines,
         "assumptions": [
@@ -1832,6 +1834,58 @@ DXF_COLORS = {
     "COLUMNS": 3, "BEAMS": 5, "SMALL_BEAMS": 4, "VBRACES": 1, "WALLS": 2, "OFFFRAME_WALLS": 30,
     "HBRACES": 6, "SLABS": 4, "CANTILEVER_SLABS": 4, "CORNER_SLABS": 3,
 }
+
+
+RHINO_PARENTS = [
+    ("COLUMNS", "柱", (0, 50)),
+    ("BEAMS", "大梁", (200, 238)),
+    ("FOUNDATION_BEAMS", "基礎梁", (262, 292)),
+    ("SMALL_BEAMS", "小梁", (170, 200)),
+    ("VBRACES", "鉛直ブレース", (300, 340)),
+    ("HBRACES", "水平ブレース", (300, 340)),
+    ("WALLS", "壁", None),
+    ("OFFFRAME_WALLS", "雑壁", None),
+    ("SLABS", "床", None),
+    ("CANTILEVER_SLABS", "片持床", None),
+    ("CORNER_SLABS", "出隅床", None),
+]
+
+
+def rhino_layer_color(hues, position):
+    if hues:
+        lo, hi = hues
+        hue = (lo + 1 + (hi - lo - 2) * position) / 360.0
+        return tuple(round(v * 255) for v in colorsys.hsv_to_rgb(hue % 1.0, 0.72, 0.85))
+    shade = round(105 + 105 * position)
+    return (shade, shade, shade)
+
+
+def assign_rhino_layers(objects, foundation_layer):
+    """Set obj["rhino_layer"] to "member::symbol" and return the layer table.
+
+    Girders on the lowest layer are foundation beams.  DXF/OBJ keep obj["layer"].
+    """
+    names = {key: name for key, name, _ in RHINO_PARENTS}
+    hues = {key: value for key, _, value in RHINO_PARENTS}
+    groups = defaultdict(set)
+    for obj in objects:
+        group = obj["kind"]
+        if group == "BEAMS" and obj["level"] == foundation_layer:
+            group = "FOUNDATION_BEAMS"
+        symbol = (obj["symbol"] or "符号なし").replace("::", "_")
+        obj["rhino_layer"] = f"{names.get(group, group)}::{symbol}"
+        groups[group].add(symbol)
+    order = [key for key, _, _ in RHINO_PARENTS]
+    table = []
+    for group in sorted(groups, key=lambda key: (order.index(key) if key in order else len(order), key)):
+        parent = names.get(group, group)
+        table.append({"path": parent, "parent": None, "name": parent, "color": list(rhino_layer_color(hues.get(group), 0.5))})
+        symbols = sorted(groups[group], key=lambda value: (len(value), value))
+        for index, symbol in enumerate(symbols):
+            position = index / (len(symbols) - 1) if len(symbols) > 1 else 0.5
+            table.append({"path": f"{parent}::{symbol}", "parent": parent, "name": symbol,
+                          "color": list(rhino_layer_color(hues.get(group), position))})
+    return table
 
 
 def kind_from_layer(layer_name: str):
@@ -2045,12 +2099,13 @@ def write_3dm(model: dict, path: Path, verify_path: Path):
     file3dm.Settings.ModelAbsoluteTolerance = 0.01
     file3dm.Settings.ModelAngleToleranceDegrees = 1.0
     layer_indexes = {}
-    for layer_name in sorted({obj["layer"] for obj in model["objects"]}):
-        kind = kind_from_layer(layer_name)
+    for entry in model["rhino_layers"]:
         layer = rhino3dm.Layer()
-        layer.Name = layer_name
-        layer.Color = COLORS.get(kind, (180, 180, 180)) + (255,)
-        layer_indexes[layer_name] = file3dm.Layers.Add(layer)
+        layer.Name = entry["name"]
+        layer.Color = tuple(entry["color"]) + (255,)
+        if entry["parent"]:
+            layer.ParentLayerId = file3dm.Layers.FindIndex(layer_indexes[entry["parent"]]).Id
+        layer_indexes[entry["path"]] = file3dm.Layers.Add(layer)
 
     for obj in model["objects"]:
         mesh = rhino3dm.Mesh()
@@ -2067,7 +2122,7 @@ def write_3dm(model: dict, path: Path, verify_path: Path):
         mesh.Compact()
         attributes = rhino3dm.ObjectAttributes()
         attributes.Name = obj["name"]
-        attributes.LayerIndex = layer_indexes[obj["layer"]]
+        attributes.LayerIndex = layer_indexes[obj["rhino_layer"]]
         attributes.SetUserString("SS7.Kind", obj["kind"])
         attributes.SetUserString("SS7.Level", obj["level"])
         attributes.SetUserString("SS7.Symbol", obj["symbol"])
@@ -2105,11 +2160,13 @@ def write_3dm(model: dict, path: Path, verify_path: Path):
         "path": str(path.resolve()),
         "object_count_expected": len(model["objects"]),
         "object_count_readback": len(check.Objects),
+        "layer_count_expected": len(model["rhino_layers"]),
         "layer_count_readback": len(check.Layers),
         "units_readback": str(check.Settings.ModelUnitSystem),
         "invalid_geometry_count": invalid_count,
         "open_mesh_count": open_mesh_count,
-        "valid": len(check.Objects) == len(model["objects"]) and invalid_count == 0,
+        "valid": (len(check.Objects) == len(model["objects"]) and invalid_count == 0
+                  and len(check.Layers) == len(model["rhino_layers"])),
     }
     verify_path.write_text(json.dumps(verification, ensure_ascii=False, indent=2), encoding="utf-8")
     return verification
