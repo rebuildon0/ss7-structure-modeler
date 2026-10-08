@@ -803,11 +803,14 @@ def make_model(csv_path: Path) -> dict:
     lowest_layer = layers_top_down[-1]
     level_follow_counts = Counter()
     girder_top_offset = {}
+    girder_depth = {}
+    column_dims = {}
     girders_by_layer = defaultdict(list)
     node_top_offsets = defaultdict(list)
     for spec in beam_specs:
         offset = spec["center_offset"] + spec["section"][1] / 2.0
         girder_top_offset[spec["beam_key"]] = offset
+        girder_depth[spec["beam_key"]] = spec["section"][1]
         girders_by_layer[spec["layer"]].append((spec["node1"], spec["node2"], offset))
         for node in (spec["node1"], spec["node2"]):
             node_top_offsets[resolve_node(spec["layer"], node)].append(offset)
@@ -915,6 +918,7 @@ def make_model(csv_path: Path) -> dict:
         if not section or section[0] <= 0 or section[1] <= 0:
             section = (100.0, 100.0, "fallback")
             fallback_sections[f"column {story}/{symbol}"] += 1
+        column_dims[(story, node)] = (section[0], section[1])
         bottom_point = node_point(bottom, node)
         top_point = node_point(top, node)
         bottom_original_z = bottom_point[2]
@@ -1180,24 +1184,35 @@ def make_model(csv_path: Path) -> dict:
         key = (clean(row[0]), tuple(sorted((opening_node1, opening_node2))))
         wall_openings_by_key[key].append((opening_index, row))
 
-    def opening_interval(total, type_number, first, second):
+    # SS7 入力編 7.4 開口: tens digit = horizontal type, units digit = vertical type.
+    # 1 near->near edge, 2 near->centre, 3 both sides, 4 wall length/height,
+    # 5 far->centre, 6 far->far edge ("near" = left / bottom).  Sizes use the
+    # absolute value; distances > 0 are from the grid/floor line, <= 0 from the
+    # column/beam face.  SS3 single-digit types are converted to SS7 types.
+    SS3_OPENING_TYPES = {"1": "21", "2": "33", "3": "13", "4": "63", "5": "11", "6": "61"}
+
+    def opening_interval(type_number, first, second, near, far):
+        """Return (start, end) along one direction.
+
+        near(value)/far(value) map an SS7 distance to a coordinate measured
+        from the near end (left/bottom) and from the far end (right/top).
+        """
+        size = abs(first)
         if type_number == 1:
-            start, size = first, second
-        elif type_number == 2:
-            start, size = first - second, second
-        elif type_number == 3:
-            start, size = total - first - second, second
-        elif type_number == 4:
-            start, size = total - first, second
-        elif type_number == 5:
-            start, size = first, total - first - second
-        else:
-            raise ValueError(f"Unsupported wall-opening hold type: {type_number}")
-        interpretation = "official-type"
-        if size <= 0.0 and first > 0.0 and second >= 0.0:
-            start, size = second, first
-            interpretation = "zero-size-swapped"
-        return start, size, interpretation
+            start = near(second)
+            return start, start + size
+        if type_number == 2:
+            centre = near(second)
+            return centre - size / 2.0, centre + size / 2.0
+        if type_number in (3, 4):
+            return near(first), far(second)
+        if type_number == 5:
+            centre = far(second)
+            return centre - size / 2.0, centre + size / 2.0
+        if type_number == 6:
+            end = far(second)
+            return end - size, end
+        raise ValueError(f"Unsupported wall-opening hold type: {type_number}")
 
     matched_wall_opening_indexes = set()
 
@@ -1220,27 +1235,45 @@ def make_model(csv_path: Path) -> dict:
         opening_key = (story, tuple(sorted((node1, node2))))
         opening_records = []
         plan_length = math.hypot(p2b[0] - p1b[0], p2b[1] - p1b[1])
-        wall_height = max(p1t[2], p2t[2]) - min(p1b[2], p2b[2])
+        wall_bottom_z = min(p1b[2], p2b[2])
+        wall_height = max(p1t[2], p2t[2]) - wall_bottom_z
+        # Faces used by opening references: columns at both wall ends, the
+        # lower girder top and the upper girder bottom.
+        along_x = node1[1] == node2[1]
+        def column_half(node):
+            dims = column_dims.get((story, node))
+            return (dims[0] if along_x else dims[1]) / 2.0 if dims else 0.0
+        left_face, right_face = column_half(node1), plan_length - column_half(node2)
+        floor_bottom = node_point(bottom, node1)[2] - wall_bottom_z
+        floor_top = node_point(top, node1)[2] - wall_bottom_z
+        beam_top_bottom = floor_bottom + bottom_delta
+        upper_key = (top, tuple(sorted((node1, node2))))
+        beam_bottom_top = floor_top + top_delta - girder_depth.get(upper_key, 0.0)
+        near_x = lambda value: value if value > 0 else left_face - value
+        far_x = lambda value: plan_length - value if value > 0 else right_face + value
+        near_z = lambda value: floor_bottom + value if value > 0 else beam_top_bottom - value
+        far_z = lambda value: floor_top - value if value > 0 else beam_bottom_top + value
         for opening_index, opening_row in wall_openings_by_key.get(opening_key, []):
             control = re.sub(r"\D", "", clean(opening_row[3]))
-            if len(control) < 2:
+            control = SS3_OPENING_TYPES.get(control, control)
+            if len(control) != 2:
                 warning_counts["wall openings with unknown hold types skipped"] += 1
                 continue
             try:
                 type_x, type_y = int(control[0]), int(control[1])
-                left, width, x_interpretation = opening_interval(
-                    plan_length, type_x, number(opening_row[4]), number(opening_row[5])
+                left, right = opening_interval(
+                    type_x, number(opening_row[4]), number(opening_row[5]), near_x, far_x
                 )
-                opening_bottom, height, y_interpretation = opening_interval(
-                    wall_height, type_y, number(opening_row[6]), number(opening_row[7])
+                opening_bottom, opening_top = opening_interval(
+                    type_y, number(opening_row[6]), number(opening_row[7]), near_z, far_z
                 )
             except ValueError:
                 warning_counts["wall openings with unsupported hold types skipped"] += 1
                 continue
-            right = left + width
-            opening_top = opening_bottom + height
+            width = right - left
+            height = opening_top - opening_bottom
             if (
-                width <= 0.0 or height <= 0.0 or left < -1e-6 or opening_bottom < -1e-6
+                width <= 1e-6 or height <= 1e-6 or left < -1e-6 or opening_bottom < -1e-6
                 or right > plan_length + 1e-6 or opening_top > wall_height + 1e-6
             ):
                 warning_counts["wall openings outside host walls skipped"] += 1
@@ -1256,7 +1289,8 @@ def make_model(csv_path: Path) -> dict:
                 "top_mm": min(wall_height, opening_top),
                 "width_mm": width,
                 "height_mm": height,
-                "interpretation": {"x": x_interpretation, "y": y_interpretation},
+                "interpretation": "SS7 入力編 7.4 開口",
+                "input_mm": [number(opening_row[index]) for index in range(4, 8)],
                 "weight_n_per_m2": number(opening_row[8]) if len(opening_row) > 8 else 0.0,
             }
             opening_records.append(record)
