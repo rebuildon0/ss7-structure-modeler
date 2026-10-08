@@ -797,6 +797,72 @@ def make_model(csv_path: Path) -> dict:
                 "symbol": spec["symbol"],
             })
 
+    # Members other than girders follow the girder levels.  Offsets are the
+    # girder top relative to its node on the SS7 layer (beam_center_offset + depth/2).
+    lowest_layer = layers_top_down[-1]
+    level_follow_counts = Counter()
+    girder_top_offset = {}
+    girders_by_layer = defaultdict(list)
+    node_top_offsets = defaultdict(list)
+    for spec in beam_specs:
+        offset = spec["center_offset"] + spec["section"][1] / 2.0
+        girder_top_offset[spec["beam_key"]] = offset
+        girders_by_layer[spec["layer"]].append((spec["node1"], spec["node2"], offset))
+        for node in (spec["node1"], spec["node2"]):
+            node_top_offsets[resolve_node(spec["layer"], node)].append(offset)
+
+    def layer_default_top_offset(layer):
+        setting = beam_level_defaults.get(layer)
+        if not setting:
+            return 0.0
+        if setting["control"] == "上面":
+            return setting["dimension_mm"]
+        return None
+
+    def fallback_offset(kind, layer):
+        default = layer_default_top_offset(layer)
+        if default is None:
+            level_follow_counts[f"{kind}: unchanged"] += 1
+            return 0.0, "unchanged"
+        level_follow_counts[f"{kind}: layer-default"] += 1
+        return default, "layer-default"
+
+    def segment_top_offset(kind, layer, node1, node2):
+        offset = girder_top_offset.get((layer, tuple(sorted((node1, node2)))))
+        if offset is not None:
+            level_follow_counts[f"{kind}: girder"] += 1
+            return offset, "girder"
+        return fallback_offset(kind, layer)
+
+    def node_top_offset(kind, layer, node, lowest=True):
+        offsets = node_top_offsets.get(resolve_node(layer, node))
+        if offsets:
+            level_follow_counts[f"{kind}: girder"] += 1
+            return (min(offsets) if lowest else max(offsets)), "girder"
+        return fallback_offset(kind, layer)
+
+    def panel_top_offset(kind, layer, xs, ys):
+        """Lowest girder top on the boundary of a slab panel."""
+        x_lo, x_hi = sorted(x_pos[axis] for axis in xs)
+        y_lo, y_hi = sorted(y_pos[axis] for axis in ys)
+        offsets = []
+        for (ax1, ay1), (ax2, ay2), offset in girders_by_layer.get(layer, []):
+            if ay1 == ay2 and ay1 in ys:
+                lo, hi = sorted((x_pos[ax1], x_pos[ax2]))
+                if min(hi, x_hi) - max(lo, x_lo) > 1e-6:
+                    offsets.append(offset)
+            elif ax1 == ax2 and ax1 in xs:
+                lo, hi = sorted((y_pos[ay1], y_pos[ay2]))
+                if min(hi, y_hi) - max(lo, y_lo) > 1e-6:
+                    offsets.append(offset)
+        if offsets:
+            level_follow_counts[f"{kind}: girder"] += 1
+            return min(offsets), "girder"
+        return fallback_offset(kind, layer)
+
+    def lift(point, delta):
+        return (point[0], point[1], point[2] + delta)
+
     column_length_counts = Counter()
     column_extension_total_mm = 0.0
     column_max_endpoint_extension_mm = 0.0
@@ -854,10 +920,24 @@ def make_model(csv_path: Path) -> dict:
         top_original_z = top_point[2]
         bottom_faces = incident_beam_faces.get(resolve_node(bottom, node), [])
         top_faces = incident_beam_faces.get(resolve_node(top, node), [])
-        bottom_target_z = min((face["top_z"] for face in bottom_faces), default=bottom_original_z)
-        top_target_z = max((face["bottom_z"] for face in top_faces), default=top_original_z)
-        bottom_adjusted_z = min(bottom_original_z, bottom_target_z)
-        top_adjusted_z = max(top_original_z, top_target_z)
+        if top_faces:
+            top_target_z = max(face["top_z"] for face in top_faces)
+            level_follow_counts["COLUMNS top: girder"] += 1
+        else:
+            top_target_z = top_original_z + fallback_offset("COLUMNS top", top)[0]
+        if bottom_faces and bottom == lowest_layer:
+            bottom_target_z = min(face["bottom_z"] for face in bottom_faces)
+            level_follow_counts["COLUMNS bottom: foundation girder bottom"] += 1
+        elif bottom_faces:
+            bottom_target_z = max(face["top_z"] for face in bottom_faces)
+            level_follow_counts["COLUMNS bottom: girder"] += 1
+        elif bottom == lowest_layer:
+            bottom_target_z = bottom_original_z
+            level_follow_counts["COLUMNS bottom: unchanged"] += 1
+        else:
+            bottom_target_z = bottom_original_z + fallback_offset("COLUMNS bottom", bottom)[0]
+        bottom_adjusted_z = bottom_target_z
+        top_adjusted_z = top_target_z
         bottom_extension = bottom_original_z - bottom_adjusted_z
         top_extension = top_adjusted_z - top_original_z
         bottom_point = (bottom_point[0], bottom_point[1], bottom_adjusted_z)
@@ -875,7 +955,7 @@ def make_model(csv_path: Path) -> dict:
             "top_incident_beams": sorted({face["source"] for face in top_faces}),
         }
         placement_adjustments = None
-        if bottom_extension > 1e-6 or top_extension > 1e-6:
+        if abs(bottom_extension) > 1e-6 or abs(top_extension) > 1e-6:
             placement_adjustments = {"column_length": column_adjustment}
         column_added = add_linear(
             "COLUMNS", story, symbol, bottom_point, top_point, section[0], section[1],
@@ -884,19 +964,19 @@ def make_model(csv_path: Path) -> dict:
         if column_added:
             column_length_counts["columns"] += 1
             column_length_counts["endpoints_with_incident_beams"] += int(bool(bottom_faces)) + int(bool(top_faces))
-            if bottom_faces and bottom_adjusted_z > bottom_target_z + 1e-6:
-                column_length_counts["remaining_separated_endpoints"] += 1
-            if top_faces and top_adjusted_z < top_target_z - 1e-6:
-                column_length_counts["remaining_separated_endpoints"] += 1
             if bottom_extension > 1e-6:
                 column_length_counts["bottom_endpoints_extended"] += 1
+            elif bottom_extension < -1e-6:
+                column_length_counts["bottom_endpoints_shortened"] += 1
             if top_extension > 1e-6:
                 column_length_counts["top_endpoints_extended"] += 1
-            if bottom_extension > 1e-6 or top_extension > 1e-6:
+            elif top_extension < -1e-6:
+                column_length_counts["top_endpoints_shortened"] += 1
+            if abs(bottom_extension) > 1e-6 or abs(top_extension) > 1e-6:
                 column_length_counts["columns_extended"] += 1
                 column_extension_total_mm += bottom_extension + top_extension
                 column_max_endpoint_extension_mm = max(
-                    column_max_endpoint_extension_mm, bottom_extension, top_extension
+                    column_max_endpoint_extension_mm, abs(bottom_extension), abs(top_extension)
                 )
 
     beam_keys = set()
@@ -1064,10 +1144,10 @@ def make_model(csv_path: Path) -> dict:
             continue
         if len(row) >= 7 and (clean(row[5]) not in ("", "NO") or clean(row[6]) not in ("", "NO")):
             nondefault_floor_transforms += 1
-        polygon = [
-            node_point(layer, (xs[0], ys[0])), node_point(layer, (xs[1], ys[0])),
-            node_point(layer, (xs[1], ys[1])), node_point(layer, (xs[0], ys[1])),
-        ]
+        panel_delta, _ = panel_top_offset("SMALL_BEAMS panels", layer, xs, ys)
+        polygon = [lift(node_point(layer, node), panel_delta) for node in (
+            (xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[1]), (xs[0], ys[1]),
+        )]
         small_beam_counts["floor_assemblies_expanded"] += 1
         expand_floor_shape(
             layer, area, floor_key, shape_id, polygon, (),
@@ -1131,8 +1211,10 @@ def make_model(csv_path: Path) -> dict:
             continue
         node1, node2 = segment_from(row[1])
         bottom, top = story_to_layers[story]
-        p1b, p2b = node_point(bottom, node1), node_point(bottom, node2)
-        p1t, p2t = node_point(top, node1), node_point(top, node2)
+        bottom_delta, bottom_source = segment_top_offset("WALLS bottom", bottom, node1, node2)
+        top_delta, top_source = segment_top_offset("WALLS top", top, node1, node2)
+        p1b, p2b = lift(node_point(bottom, node1), bottom_delta), lift(node_point(bottom, node2), bottom_delta)
+        p1t, p2t = lift(node_point(top, node1), top_delta), lift(node_point(top, node2), top_delta)
         thickness = wall_sections.get(symbol, 0.0)
         opening_key = (story, tuple(sorted((node1, node2))))
         opening_records = []
@@ -1187,9 +1269,12 @@ def make_model(csv_path: Path) -> dict:
             continue
         if thickness <= 0.0:
             zero_thickness_walls += 1
-        placement_adjustments = None
+        placement_adjustments = {"level_follow": {
+            "bottom_delta_mm": bottom_delta, "bottom_source": bottom_source,
+            "top_delta_mm": top_delta, "top_source": top_source,
+        }}
         if opening_records:
-            placement_adjustments = {"wall_openings": opening_records}
+            placement_adjustments["wall_openings"] = opening_records
             wall_opening_counts["host_walls"] += 1
             wall_opening_counts["modeled"] += len(opening_records)
         add_object(
@@ -1231,8 +1316,10 @@ def make_model(csv_path: Path) -> dict:
         upper_story = story_order[upper_index]
         bottom_layer = story_to_layers[lower_story][0]
         top_layer = story_to_layers[upper_story][1]
-        bottom_origin = node_point(bottom_layer, base_node)
-        top_origin = node_point(top_layer, base_node)
+        bottom_delta, bottom_source = node_top_offset("OFFFRAME_WALLS bottom", bottom_layer, base_node)
+        top_delta, top_source = node_top_offset("OFFFRAME_WALLS top", top_layer, base_node)
+        bottom_origin = lift(node_point(bottom_layer, base_node), bottom_delta)
+        top_origin = lift(node_point(top_layer, base_node), top_delta)
 
         coordinate_values = [clean(value) for value in row[5:9]]
         if any(value.startswith("/") for value in coordinate_values):
@@ -1261,7 +1348,11 @@ def make_model(csv_path: Path) -> dict:
                 "end_offset_xy_mm": [end_x, end_y],
                 "plan_start_mm": list(p1b[:2]),
                 "plan_end_mm": list(p2b[:2]),
-            }
+            },
+            "level_follow": {
+                "bottom_delta_mm": bottom_delta, "bottom_source": bottom_source,
+                "top_delta_mm": top_delta, "top_source": top_source,
+            },
         }
         add_object(
             "OFFFRAME_WALLS", level_label, symbol, vertices, faces, row[2],
@@ -1388,10 +1479,10 @@ def make_model(csv_path: Path) -> dict:
             duplicate_slabs += 1
             continue
         slab_keys.add(key)
-        corners = [
-            node_point(layer, (xs[0], ys[0])), node_point(layer, (xs[1], ys[0])),
-            node_point(layer, (xs[1], ys[1])), node_point(layer, (xs[0], ys[1])),
-        ]
+        slab_delta, slab_source = panel_top_offset("SLABS", layer, xs, ys)
+        corners = [lift(node_point(layer, node), slab_delta) for node in (
+            (xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[1]), (xs[0], ys[1]),
+        )]
         thickness = slab_sections.get(symbol, 0.0)
         if thickness <= 0.0:
             fallback_sections[f"slab {layer}/{symbol} (surface only)"] += 1
@@ -1400,7 +1491,10 @@ def make_model(csv_path: Path) -> dict:
         except ValueError:
             warning_counts["degenerate slab areas skipped after same-node mapping"] += 1
             continue
-        add_object("SLABS", layer, symbol, vertices, faces, row[1], (thickness, 0.0))
+        add_object(
+            "SLABS", layer, symbol, vertices, faces, row[1], (thickness, 0.0),
+            placement_adjustments={"level_follow": {"delta_mm": slab_delta, "source": slab_source}},
+        )
 
     cantilever_shape_rows = sections.get("片持床形状配置", []) + sections.get("片持床形状", [])
     cantilever_shapes = {}
@@ -1429,7 +1523,8 @@ def make_model(csv_path: Path) -> dict:
         except ValueError:
             warning_counts["unparsed cantilever slab support segments skipped"] += 1
             continue
-        p1, p2 = node_point(layer, node1), node_point(layer, node2)
+        cantilever_delta, cantilever_source = segment_top_offset("CANTILEVER_SLABS", layer, node1, node2)
+        p1, p2 = lift(node_point(layer, node1), cantilever_delta), lift(node_point(layer, node2), cantilever_delta)
         horizontal = (p2[0] - p1[0], p2[1] - p1[1], 0.0)
         try:
             tangent = vunit(horizontal)
@@ -1479,7 +1574,8 @@ def make_model(csv_path: Path) -> dict:
                 "root_end_mm": list(root_end),
                 "tip_start_mm": list(tip_start),
                 "tip_end_mm": list(tip_end),
-            }
+            },
+            "level_follow": {"delta_mm": cantilever_delta, "source": cantilever_source},
         }
         add_object(
             "CANTILEVER_SLABS", layer, symbol, vertices, faces, row[1],
@@ -1510,7 +1606,8 @@ def make_model(csv_path: Path) -> dict:
         tip_move = number(row[7])
         if abs(tip_move) > 1e-9:
             warning_counts["nonzero corner slab tip movements not applied"] += 1
-        base = node_point(layer, base_node)
+        corner_delta, corner_source = node_top_offset("CORNER_SLABS", layer, base_node)
+        base = lift(node_point(layer, base_node), corner_delta)
         x_tip = vadd(base, (x_sign * x_projection, 0.0, 0.0))
         outer = vadd(base, (x_sign * x_projection, y_sign * y_projection, 0.0))
         y_tip = vadd(base, (0.0, y_sign * y_projection, 0.0))
@@ -1532,7 +1629,8 @@ def make_model(csv_path: Path) -> dict:
                 "tip_move_mm": tip_move,
                 "base_mm": list(base),
                 "outer_corner_mm": list(outer),
-            }
+            },
+            "level_follow": {"delta_mm": corner_delta, "source": corner_source},
         }
         add_object(
             "CORNER_SLABS", layer, symbol, vertices, faces, row[1],
@@ -1647,8 +1745,11 @@ def make_model(csv_path: Path) -> dict:
                 "top_endpoints_extended": column_length_counts["top_endpoints_extended"],
                 "total_extension_mm": round(column_extension_total_mm, 6),
                 "max_endpoint_extension_mm": round(column_max_endpoint_extension_mm, 6),
+                "bottom_endpoints_shortened": column_length_counts["bottom_endpoints_shortened"],
+                "top_endpoints_shortened": column_length_counts["top_endpoints_shortened"],
                 "remaining_separated_endpoints": column_length_counts["remaining_separated_endpoints"],
             },
+            "level_follow": dict(sorted(level_follow_counts.items())),
             "supplemental_elements": {
                 "offframe_wall_input_rows": offframe_wall_counts["input_rows"],
                 "offframe_walls_modeled": offframe_wall_counts["modeled"],
@@ -2069,15 +2170,16 @@ def write_report(model: dict, path: Path, source: Path, artifacts: dict, verific
         "- SS7層レベルを梁上端の基準とし、上面・中心・下面の押さえと部材せいから梁中心Zを算出した。",
         "- レベル調整値は正を上方向、負を下方向として反映した。",
         "",
-        "## 梁レベルに連動した柱長さ",
+        "## 梁レベルへの追従（柱・壁・床・小梁）",
         "",
         f"- 接続梁を確認した柱端部: {column_lengths['endpoints_with_incident_beams']} 箇所",
-        f"- 梁まで延長した柱: {column_lengths['columns_extended']} 本",
-        f"- 柱脚を下へ延長: {column_lengths['bottom_endpoints_extended']} 箇所",
-        f"- 柱頭を上へ延長: {column_lengths['top_endpoints_extended']} 箇所",
-        f"- 最大延長量: {column_lengths['max_endpoint_extension_mm']:.1f} mm",
-        f"- 梁と離れた柱端部: {column_lengths['remaining_separated_endpoints']} 箇所",
-        "- 下がった梁には上階柱の柱脚、上がった梁には下階柱の柱頭を必要量だけ延長した。通常レベルの柱長さは変更していない。",
+        f"- 長さが変わった柱: {column_lengths['columns_extended']} 本",
+        f"- 柱脚: 下へ延長 {column_lengths['bottom_endpoints_extended']} 箇所 / 上へ短縮 {column_lengths.get('bottom_endpoints_shortened', 0)} 箇所",
+        f"- 柱頭: 上へ延長 {column_lengths['top_endpoints_extended']} 箇所 / 下へ短縮 {column_lengths.get('top_endpoints_shortened', 0)} 箇所",
+        f"- 最大変化量: {column_lengths['max_endpoint_extension_mm']:.1f} mm",
+        "- 柱頭は節点に接する大梁の上端の最高位置、柱脚は下の節点の大梁上端の最高位置に合わせた。最下層の柱脚は基礎梁の下端（接する梁の下端の最低位置）まで伸ばした。",
+        "- 壁の上下端は同じ区間の大梁の上端、床と床組（小梁）は周囲の大梁の上端の最も低い位置、片持床は支持する大梁、出隅床とフレーム外雑壁は基準節点の大梁に合わせた。大梁がない場合は層の梁レベル標準値（上面押さえのとき）を使った。",
+        f"- 決め方の内訳: {adjustments.get('level_follow', {})}",
         "",
         "## 片持床・出隅床・フレーム外雑壁",
         "",
